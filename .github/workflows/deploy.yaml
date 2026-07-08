@@ -1,0 +1,81 @@
+name: 1 - Create Cluster and Deploy Workspace
+
+# This makes the pipeline manual, so it only runs when you click a button in GitHub
+on:
+  workflow_dispatch:
+
+# REQUIRED FOR OIDC
+permissions:
+  id-token: write 
+  contents: read  
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Connect to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::876014314701:role/GitHub-K8s-Role
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Provision EC2 Instances
+        working-directory: ./terraform
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Wait for Package Installations
+        # Giving cloud-init time to install containerd and kubeadm
+        run: echo "Waiting 3 minutes for server bootstrapping..." && sleep 180
+
+      - name: Extract SSH Key and IPs
+        working-directory: ./terraform
+        run: |
+          # Save the private key to a file and lock down its permissions
+          terraform output -raw private_key > ../ssh_key.pem
+          chmod 400 ../ssh_key.pem
+          
+          # Extract IPs into GitHub environment variables so later steps can use them
+          echo "MASTER_IP=$(terraform output -raw master_ip)" >> $GITHUB_ENV
+          WORKER_IPS=$(terraform output -json worker_ips | jq -r '.[]')
+          echo "WORKER1_IP=$(echo "$WORKER_IPS" | head -n 1)" >> $GITHUB_ENV
+          echo "WORKER2_IP=$(echo "$WORKER_IPS" | tail -n 1)" >> $GITHUB_ENV
+
+      - name: Initialize Kubernetes Master
+        run: |
+          # 1. Start the cluster
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.MASTER_IP }} "sudo kubeadm init --pod-network-cidr=10.244.0.0/16"
+          
+          # 2. Setup kubeconfig so the 'ubuntu' user can run kubectl commands
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.MASTER_IP }} "mkdir -p ~/.kube && sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown \$(id -u):\$(id -g) ~/.kube/config"
+          
+          # 3. Install Flannel (Pod Networking)
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.MASTER_IP }} "kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+          
+          # 4. Generate the secret token that workers need to join
+          JOIN_CMD=$(ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.MASTER_IP }} "kubeadm token create --print-join-command")
+          echo "JOIN_CMD=$JOIN_CMD" >> $GITHUB_ENV
+
+      - name: Join Worker Nodes
+        run: |
+          # Pass the join token into both worker nodes
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.WORKER1_IP }} "sudo ${{ env.JOIN_CMD }}"
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.WORKER2_IP }} "sudo ${{ env.JOIN_CMD }}"
+
+      - name: Deploy the Workspace
+        run: |
+          # Securely copy the workspace.yaml file from the GitHub runner over to the AWS Master node
+          scp -o StrictHostKeyChecking=no -i ssh_key.pem ./workspace/dev-workspace.yaml ubuntu@${{ env.MASTER_IP }}:/home/ubuntu/
+          
+          # Tell the Master node to apply the file
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.MASTER_IP }} "kubectl apply -f /home/ubuntu/dev-workspace.yaml"
+          
+          # Print out the final status of the pods and services
+          ssh -o StrictHostKeyChecking=no -i ssh_key.pem ubuntu@${{ env.MASTER_IP }} "kubectl get all -n dev-workspace"

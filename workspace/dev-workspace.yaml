@@ -1,0 +1,53 @@
+# 1. THE NAMESPACE
+# The "Why": Creates a virtual wall inside the cluster. If a developer messes up, 
+# it only affects this specific dev-workspace, not the rest of the cluster.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev-workspace
+
+# 2. THE DEPLOYMENT
+# The "Why": This is the "brain" that manages your containers. We are telling it 
+# to download the official NGINX image and ensure exactly 2 copies (replicas) are always running.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-app
+  namespace: dev-workspace
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: workspace-app
+  template:
+    metadata:
+      labels:
+        app: workspace-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+
+# 3. THE SERVICE (NodePort)
+# The "Why": Pods get random internal IP addresses that change constantly. 
+# This Service grabs port 30080 on the physical EC2 instance itself and permanently 
+# forwards any traffic hitting that port directly into our NGINX containers.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-service
+  namespace: dev-workspace
+spec:
+  type: NodePort
+  selector:
+    app: workspace-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      nodePort: 30080
